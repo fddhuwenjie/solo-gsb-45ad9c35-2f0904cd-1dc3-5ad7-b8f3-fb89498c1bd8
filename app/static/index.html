@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>考古地层关系推断台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">▰</span>
+    <div>
+      <h1>考古地层关系推断台</h1>
+      <p>维护“早于 / 切割 / 填充”偏序关系，自动检测矛盾链与层位窗口</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button id="btn-add-area" class="btn ghost">＋ 发掘区</button>
+    <button id="btn-add-unit" class="btn ghost">＋ 地层/遗迹</button>
+    <button id="btn-refresh" class="btn ghost">↻ 刷新</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="graph">关系图</button>
+  <button class="tab" data-tab="matrix">关系矩阵</button>
+  <button class="tab" data-tab="infer">层位推断</button>
+  <button class="tab" data-tab="history">版本 / 日志</button>
+</nav>
+
+<main>
+  <!-- 关系图 -->
+  <section id="tab-graph" class="tabpanel active">
+    <div class="split">
+      <div class="canvas-wrap">
+        <div class="canvas-toolbar">
+          <span class="hint">滚轮缩放 · 拖拽平移 · 点击节点高亮关系 · 点击边删除</span>
+          <span id="graph-summary" class="summary"></span>
+          <button class="btn mini" id="btn-reset-view">复位视图</button>
+        </div>
+        <svg id="graph" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow-earlier" markerWidth="10" markerHeight="8"
+                    refX="9" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#4e7a52"/>
+            </marker>
+            <marker id="arrow-cuts" markerWidth="10" markerHeight="8"
+                    refX="9" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#c1502e"/>
+            </marker>
+            <marker id="arrow-fills" markerWidth="10" markerHeight="8"
+                    refX="9" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#3f6d9e"/>
+            </marker>
+            <marker id="arrow-basis" markerWidth="10" markerHeight="8"
+                    refX="9" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#e0a82e"/>
+            </marker>
+          </defs>
+          <g id="viewport">
+            <g id="edge-layer"></g>
+            <g id="node-layer"></g>
+          </g>
+        </svg>
+        <div class="legend">
+          <span><i class="swatch earlier"></i>早于（时间直接指向）</span>
+          <span><i class="swatch cuts"></i>切割（打破）</span>
+          <span><i class="swatch fills"></i>填充</span>
+          <span><i class="swatch indirect"></i>间接推断路径</span>
+        </div>
+      </div>
+      <aside class="sidepanel" id="graph-side">
+        <h3>对象 / 关系录入</h3>
+        <form id="form-rel" class="card">
+          <label>关系类型
+            <select id="rel-type">
+              <option value="earlier">早于</option>
+              <option value="cuts">切割（subject 打破 object）</option>
+              <option value="fills">填充（subject 是 object 的填土）</option>
+            </select>
+          </label>
+          <div class="row2">
+            <label>主体 A
+              <select id="rel-subject"></select>
+            </label>
+            <label>客体 B
+              <select id="rel-object"></select>
+            </label>
+          </div>
+          <label>备注（可选）<input id="rel-note" type="text" placeholder="如：灰坑打破下层堆积"></label>
+          <button class="btn primary" type="submit">提交关系</button>
+          <p class="hint" id="rel-semantic"></p>
+        </form>
+        <div id="inspector" class="card"></div>
+        <div class="card" id="affected-card" hidden>
+          <h3>本次增量重算</h3>
+          <div id="affected-list" class="affected-list"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- 矩阵 -->
+  <section id="tab-matrix" class="tabpanel">
+    <div class="panel-head">
+      <div>
+        <h2>关系矩阵</h2>
+        <p class="hint">行 = 时间较早端，列 = 较晚端；点击空格添加关系，点击已有关系查看/删除。颜色为直接关系，淡色底纹表示可经其他关系间接推断。</p>
+      </div>
+      <div class="matrix-modes">
+        <label class="chk"><input type="checkbox" id="chk-indirect" checked> 显示间接可达</label>
+        <label class="chk"><input type="checkbox" id="chk-groupbounds"> 标出可互换组</label>
+      </div>
+    </div>
+    <div class="matrix-scroll">
+      <table id="matrix"></table>
+    </div>
+    <div id="matrix-cell-info" class="cell-pop" hidden></div>
+  </section>
+
+  <!-- 层位推断 -->
+  <section id="tab-infer" class="tabpanel">
+    <div class="panel-head">
+      <h2>层位推断与可互换组</h2>
+      <p class="hint">层位 0 = 最早（地层最下）。同一高度上窗口越大，年代位置越不确定。</p>
+    </div>
+    <div class="infer-grid">
+      <div class="card span2">
+        <h3>各对象层位窗口</h3>
+        <table class="data-table" id="layer-table">
+          <thead><tr>
+            <th>发掘区</th><th>编号</th><th>类型</th><th>名称</th>
+            <th>最早层位</th><th>最晚层位</th><th>浮动</th><th>层位窗口</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>仍可互换的对象组</h3>
+        <div id="groups-list"></div>
+      </div>
+      <div class="card">
+        <h3>推断依据查询</h3>
+        <p class="hint">选择两个对象，查看它们之间的间接关系链（若存在）。</p>
+        <div class="row2">
+          <label>从 <select id="basis-from"></select></label>
+          <label>到 <select id="basis-to"></select></label>
+        </div>
+        <button class="btn primary" id="btn-basis">查找推断链</button>
+        <div id="basis-result"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 版本/日志 -->
+  <section id="tab-history" class="tabpanel">
+    <div class="infer-grid">
+      <div class="card">
+        <h3>版本（每次成功提交自动留存）</h3>
+        <table class="data-table" id="version-table">
+          <thead><tr><th>#</th><th>时间</th><th>操作</th><th>说明</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>事件日志（含被拒绝的提交）</h3>
+        <table class="data-table" id="event-table">
+          <thead><tr><th>时间</th><th>操作</th><th>状态</th><th>详情</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 矛盾链弹窗 -->
+<div id="cycle-modal" class="modal-mask" hidden>
+  <div class="modal">
+    <h2>⛔ 检测到地层关系矛盾</h2>
+    <p class="modal-sub">提交将形成有向环（时间循环），系统已拒绝该关系。最短矛盾链如下：</p>
+    <div id="cycle-chain" class="cycle-chain"></div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-cycle-ok">我知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- 通用提示 -->
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
