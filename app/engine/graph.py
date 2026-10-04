@@ -83,7 +83,10 @@ class Poset:
         self._early = {}     # node -> 最早层位
         self._late = {}      # node -> 最晚层位
         self._tail = {}      # node -> 从该节点出发的最长链边数
-        self._height = None  # 偏序高度（最长链边数）
+        self._height = None  # 全图最大高度（各区高度的最大值）
+        # 层位按“所在发掘区”的偏序分别计算：每个区有独立的高度
+        # （区内最长链边数），area_id 为 None 的节点归入 None 区。
+        self._area_height = {}  # area_id -> 本区高度
 
         self._next_node_id = 1
         self._next_rel_id = 1
@@ -108,7 +111,10 @@ class Poset:
         }
         self.adj.setdefault(node_id, {})
         self.rad.setdefault(node_id, {})
-        # 缓存一律在首次查询时惰性构建，避免预填值污染全局统计
+        # 可达闭包在首次查询时惰性构建；新节点与任何既有节点都不可达，
+        # 不影响别人的祖先/后代缓存。只有本区高度（及层位窗口）可能因
+        # 新孤立节点而变化（通常不会，但新区高度需从无到有建立）。
+        self._invalidate_area_layers(area_id)
         return node_id
 
     def remove_node(self, node_id):
@@ -137,6 +143,24 @@ class Poset:
         self._late = {}
         self._tail = {}
         self._height = None
+        self._area_height = {}
+
+    def _invalidate_area_layers(self, *area_ids):
+        """失效指定发掘区的层位缓存（不动其他区）。
+
+        跨区关系在录入层即被拒绝，增删边只改变所在区的偏序，因此
+        其他区的最早/最晚层位与高度缓存可以原样保留。
+        """
+        touched = {a for a in area_ids if a in self._area_height}
+        for aid in touched:
+            self._area_height.pop(aid, None)
+        if touched:
+            self._height = None
+            for nid, n in self.nodes.items():
+                if n.get("area_id") in touched:
+                    self._early.pop(nid, None)
+                    self._late.pop(nid, None)
+                    self._tail.pop(nid, None)
 
     @staticmethod
     def endpoints(rtype, s, o):
@@ -295,13 +319,12 @@ class Poset:
 
         # 层位可能改变的节点恰为 Anc(early) ∪ Desc(late)：
         # 前者最晚层位可能被压低，后者最早层位可能被抬高，
-        # 其余节点层位不变。层位缓存在结构变化后统一失效，
-        # 下次查询时沿新边惰性重算（仅触及受影响节点）。
+        # 其余节点层位不变。层位缓存在结构变化后按“所在区”失效，
+        # 下次查询时沿新边惰性重算；其他发掘区的推断保持不变。
         affected = set(anc_e) | set(desc_l)
-        self._early = {}
-        self._late = {}
-        self._tail = {}
-        self._height = None
+        self._invalidate_area_layers(
+            self.nodes[early].get("area_id"),
+            self.nodes[late].get("area_id"))
         return affected
 
     def remove_rel(self, rid):
@@ -334,12 +357,12 @@ class Poset:
                 affected |= self.ancestors(y)
             for x in A:
                 affected |= self.descendants(x)
-            # 最长链回缩可能改变任意相关节点的层位，且传播面在删边时
-            # 难以精确界定，层位缓存整体失效、按需惰性重算。
-            self._early = {}
-            self._late = {}
-            self._tail = {}
-            self._height = None
+            # 最长链回缩可能改变本区任意相关节点的层位，删边时传播面
+            # 难以精确界定：本区层位缓存整体失效、按需惰性重算；
+            # 其他发掘区的偏序未变，缓存与推断结果原样保留。
+            self._invalidate_area_layers(
+                self.nodes[early].get("area_id"),
+                self.nodes[late].get("area_id"))
         return affected
 
     # ------------------------------------------------------------------
@@ -379,19 +402,41 @@ class Poset:
         self._early[node] = best
         return best
 
-    def _get_height(self):
-        """偏序高度 = 全图最长链的边数。
+    def _iter_area_nodes(self, area_id):
+        for nid, n in self.nodes.items():
+            if n.get("area_id") == area_id:
+                yield nid
 
-        直接遍历每个节点的 tail_len，而不是复用 earliest 缓存：
-        未被查询过的节点不会有 earliest 缓存，取缓存最大值会漏算。
+    def area_height(self, area_id):
+        """某发掘区的偏序高度 = 本区最长链的边数（跨区不参与）。"""
+        cached = self._area_height.get(area_id)
+        if cached is not None:
+            return cached
+        h = 0
+        for nid in self._iter_area_nodes(area_id):
+            h = max(h, self._tail_len(nid))
+        self._area_height[area_id] = h
+        return h
+
+    def _get_height(self):
+        """全图高度 = 各区高度的最大值。
+
+        层位窗口按所在区分别计算，该值仅用于整体展示；真正决定单个
+        对象最晚层位的是 :meth:`area_height`。直接遍历各节点的
+        tail_len，而不是复用 earliest 缓存：未被查询过的节点不会有
+        earliest 缓存，取缓存最大值会漏算。
         """
         if self._height is not None:
             return self._height
-        h = 0
-        for n in self.nodes:
-            h = max(h, self._tail_len(n))
+        area_ids = {n.get("area_id") for n in self.nodes.values()}
+        h = max((self.area_height(a) for a in area_ids), default=0)
         self._height = h
         return h
+
+    def area_heights(self):
+        """全部发掘区 id -> 本区高度。"""
+        area_ids = {n.get("area_id") for n in self.nodes.values()}
+        return {a: self.area_height(a) for a in area_ids}
 
     def _tail_len(self, node):
         """从 node 出发的最长链边数（记忆化）。"""
@@ -404,15 +449,18 @@ class Poset:
         return best
 
     def latest(self, node):
-        """最晚层位：高度 - 从该节点出发的最长链长度。
+        """最晚层位：所在区高度 - 从该节点出发的最长链长度。
 
-        层位编号从最早（0）到最晚（height）。earliest == latest 时
-        该单位的相对位置被约束完全锁定；窗口越大，可浮动空间越大。
+        高度只按**同一发掘区**的偏序计算：跨区关系被禁止，别区的
+        长链不应抬高或压低本区对象的层位窗口。层位编号从本区最早
+        （0）到本区最晚（area_height）。earliest == latest 时该单位
+        的相对位置被约束完全锁定；窗口越大，可浮动空间越大。
         """
         cached = self._late.get(node)
         if cached is not None:
             return cached
-        val = self._get_height() - self._tail_len(node)
+        area_id = self.nodes[node].get("area_id")
+        val = self.area_height(area_id) - self._tail_len(node)
         self._late[node] = val
         return val
 
@@ -420,29 +468,33 @@ class Poset:
     # 可互换对象组
     # ------------------------------------------------------------------
     def interchangeable_groups(self):
-        """位置等价类：严格祖先集合与严格后代集合完全相同的节点。
+        """位置等价类：同区内严格祖先集合与严格后代集合完全相同的节点。
 
         （使用去掉自身的集合：组内两节点不可比，故彼此不在对方的
         祖先/后代中，其余前驱后继则必须完全一致。）
         同组节点可在全部线性序中互换排列，即“仍可互换的对象组”。
-        仅返回大小 >= 2 的组。
+
+        分组键包含 ``area_id``：跨区对象之间不允许存在任何偏序关系，
+        分属不同发掘区的孤立对象即便祖先/后代集合同为空，也**不能**
+        进入同一可互换组。仅返回大小 >= 2 的组。
         """
         groups = {}
         for n in self.nodes:
-            key = (frozenset(self.ancestors(n) - {n}),
+            area_id = self.nodes[n].get("area_id")
+            key = (area_id,
+                   frozenset(self.ancestors(n) - {n}),
                    frozenset(self.descendants(n) - {n}))
             groups.setdefault(key, []).append(n)
         result = []
-        for members in groups.values():
+        for (area_id, _anc_key, _desc_key), members in groups.items():
             if len(members) >= 2:
-                members_sorted = sorted(
-                    members,
-                    key=lambda x: (self.nodes[x].get("area_id") or "",
-                                   self.nodes[x]["code"]))
+                members_sorted = sorted(members, key=lambda x: self.nodes[x]["code"])
                 result.append({
+                    "area_id": area_id,
                     "members": members_sorted,
                     "earliest": self.earliest(members_sorted[0]),
                     "latest": self.latest(members_sorted[0]),
                 })
-        result.sort(key=lambda g: (g["earliest"], g["members"][0]))
+        result.sort(key=lambda g: (str(g["area_id"] or ""),
+                                   g["earliest"], g["members"][0]))
         return result

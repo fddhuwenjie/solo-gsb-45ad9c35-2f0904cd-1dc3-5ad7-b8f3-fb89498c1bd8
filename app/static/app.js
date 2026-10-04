@@ -9,6 +9,7 @@ const REL_META = {
 
 const state = {
   areas: [], nodes: [], edges: [], groups: [], height: 0,
+  areaHeights: {},
   affected: [],
   nodeById: new Map(),
   // 邻接（时间方向 early -> late）：nodeId -> Map(lateId -> [edge...])
@@ -18,6 +19,13 @@ const state = {
   selectedNode: null,
   highlightPath: null, // [nodeId...]
 };
+
+// 层位窗口按所在发掘区的偏序高度分别计算（跨区不串扰）；
+// 老数据没有 area_height 字段时回退到节点自身层位。
+function nodeHeight(n) {
+  const h = state.areaHeights[String(n.area_id)];
+  return h == null ? (n.area_height ?? state.height) : h;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -41,6 +49,7 @@ function indexState(s) {
   state.edges = s.edges;
   state.groups = s.groups;
   state.height = s.height;
+  state.areaHeights = s.area_heights || {};
   state.affected = s.affected || [];
   state.nodeById = new Map(s.nodes.map((n) => [n.id, n]));
   state.adj = new Map(s.nodes.map((n) => [n.id, new Map()]));
@@ -76,9 +85,17 @@ function renderAll(showAffected = false) {
 }
 
 function renderSummary() {
+  const byArea = {};
+  for (const a of state.areas) byArea[a.id] = { code: a.code, h: 0 };
+  for (const n of state.nodes) {
+    const entry = byArea[n.area_id];
+    if (entry) entry.h = Math.max(entry.h, nodeHeight(n));
+  }
+  const spanTxt = Object.values(byArea)
+    .map((x) => `${x.code} ${x.h} 层`).join(" · ");
   $("#graph-summary").textContent =
     `${state.nodes.length} 个对象 · ${state.edges.length} 条关系 · ` +
-    `时间跨度 ${state.height} 层`;
+    `时间跨度 ${spanTxt}`;
 }
 
 // ---------------------------------------------------------------------
@@ -133,7 +150,7 @@ function updateRelSemantic() {
 // SVG 关系图（分层布局，最早在底）
 // ---------------------------------------------------------------------
 const view = { x: 0, y: 0, k: 1 };
-const NODE_W = 92, NODE_H = 46, LEVEL_GAP = 104, NODE_GAP = 26;
+const NODE_W = 112, NODE_H = 46, LEVEL_GAP = 104, NODE_GAP = 26;
 
 function levelOf(n) { return n.earliest; }
 
@@ -210,10 +227,11 @@ function renderNodes(pos) {
       "data-id": n.id,
     });
     g.appendChild(el("rect", { width: p.w, height: p.h, rx: 7 }));
-    g.appendChild(el("text", { class: "code", x: p.w / 2, y: 19 }, n.code));
+    g.appendChild(el("text", { class: "code", x: p.w / 2, y: 19 },
+      `[${n.area_code}] ${n.code}`));
     const lvTxt = n.fixed
-      ? `层位 ${n.earliest}`
-      : `层位 ${n.earliest}~${n.latest}`;
+      ? `本区层位 ${n.earliest}`
+      : `本区层位 ${n.earliest}~${n.latest}`;
     g.appendChild(el("text", { class: "lv", x: p.w / 2, y: 35 }, lvTxt));
     g.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -578,8 +596,9 @@ function renderInference() {
   tb.innerHTML = "";
   for (const n of sortedNodes()) {
     const tr = el("tr");
-    const pctE = state.height ? (n.earliest / state.height) * 100 : 0;
-    const pctL = state.height ? (n.latest / state.height) * 100 : 100;
+    const nh = nodeHeight(n);
+    const pctE = nh ? (n.earliest / nh) * 100 : 0;
+    const pctL = nh ? (n.latest / nh) * 100 : 100;
     tr.innerHTML =
       `<td>${n.area_code}</td><td><b>${n.code}</b></td>` +
       `<td>${n.kind === "layer" ? "地层" : "遗迹"}</td>` +
@@ -605,8 +624,9 @@ function renderInference() {
   for (const g of state.groups) {
     const chip = el("div", { class: "group-chip" });
     chip.innerHTML =
+      `<span class="chain-note">[${g.area_code || ""}]</span> ` +
       `<b>${g.codes.join(" · ")}</b><br>` +
-      `<span class="chain-note">同处层位 ${g.earliest}` +
+      `<span class="chain-note">同处本区层位 ${g.earliest}` +
       (g.earliest === g.latest ? "" : `～${g.latest}`) +
       `，前驱与后继集合完全一致，可在年代序列中互换，共 ${g.members.length} 个。</span>`;
     gl.appendChild(chip);

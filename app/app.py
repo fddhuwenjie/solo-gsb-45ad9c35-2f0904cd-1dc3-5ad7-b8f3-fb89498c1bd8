@@ -145,6 +145,8 @@ def build_state(affected=None):
     conn = db()
     units = {u["id"]: u for u in storage.list_units(conn)}
     rels_db = {r["id"]: r for r in storage.list_relations(conn)}
+    area_rows = storage.list_areas(conn)
+    area_heights = p.area_heights()
 
     nodes = []
     for nid, n in sorted(p.nodes.items(), key=lambda kv: int(kv[0])):
@@ -159,6 +161,8 @@ def build_state(affected=None):
             "area_code": u.get("area_code", ""),
             "earliest": e,
             "latest": l,
+            # 层位窗口按所在区偏序计算：本区高度决定最晚层位
+            "area_height": area_heights.get(n.get("area_id"), 0),
             "fixed": e == l,
             "slack": l - e,
         })
@@ -173,19 +177,25 @@ def build_state(affected=None):
 
     groups = []
     for g in p.interchangeable_groups():
+        members = g["members"]
+        area_row = next((a for a in area_rows
+                         if str(a["id"]) == str(g["area_id"])), None)
         groups.append({
-            "members": g["members"],
+            "members": members,
+            "area_id": g["area_id"],
+            "area_code": area_row["code"] if area_row else "",
             "earliest": g["earliest"],
             "latest": g["latest"],
-            "codes": [p.nodes[m]["code"] for m in g["members"]],
+            "codes": [p.nodes[m]["code"] for m in members],
         })
 
     return {
-        "areas": storage.list_areas(conn),
+        "areas": area_rows,
         "nodes": nodes,
         "edges": edges,
         "groups": groups,
         "height": p._get_height(),
+        "area_heights": {str(a): h for a, h in area_heights.items()},
         "relation_types": [{"value": t, "label": REL_LABEL[t]}
                            for t in REL_TYPES],
         "affected": sorted(affected or [], key=int),
