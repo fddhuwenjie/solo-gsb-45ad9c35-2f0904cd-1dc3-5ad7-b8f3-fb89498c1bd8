@@ -578,8 +578,10 @@ function renderInference() {
   tb.innerHTML = "";
   for (const n of sortedNodes()) {
     const tr = el("tr");
-    const pctE = state.height ? (n.earliest / state.height) * 100 : 0;
-    const pctL = state.height ? (n.latest / state.height) * 100 : 100;
+    // 层位窗口只在本区偏序高度内归一化，避免长链区压扁孤立区窗口
+    const ah = n.area_height ?? state.height;
+    const pctE = ah ? (n.earliest / ah) * 100 : 0;
+    const pctL = ah ? (n.latest / ah) * 100 : 100;
     tr.innerHTML =
       `<td>${n.area_code}</td><td><b>${n.code}</b></td>` +
       `<td>${n.kind === "layer" ? "地层" : "遗迹"}</td>` +
@@ -606,9 +608,9 @@ function renderInference() {
     const chip = el("div", { class: "group-chip" });
     chip.innerHTML =
       `<b>${g.codes.join(" · ")}</b><br>` +
-      `<span class="chain-note">同处层位 ${g.earliest}` +
+      `<span class="chain-note">[${g.area_code || "?"}] 同处层位 ${g.earliest}` +
       (g.earliest === g.latest ? "" : `～${g.latest}`) +
-      `，前驱与后继集合完全一致，可在年代序列中互换，共 ${g.members.length} 个。</span>`;
+      `，前驱与后继集合完全一致，可在本区年代序列中互换，共 ${g.members.length} 个。</span>`;
     gl.appendChild(chip);
   }
 }

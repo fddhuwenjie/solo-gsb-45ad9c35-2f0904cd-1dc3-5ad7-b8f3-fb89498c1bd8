@@ -159,6 +159,7 @@ def build_state(affected=None):
             "area_code": u.get("area_code", ""),
             "earliest": e,
             "latest": l,
+            "area_height": p.area_height(nid),
             "fixed": e == l,
             "slack": l - e,
         })
@@ -173,8 +174,12 @@ def build_state(affected=None):
 
     groups = []
     for g in p.interchangeable_groups():
+        area_row = next((a for a in storage.list_areas(conn)
+                         if str(a["id"]) == str(g.get("area_id"))), None)
         groups.append({
             "members": g["members"],
+            "area_id": g.get("area_id"),
+            "area_code": area_row["code"] if area_row else "",
             "earliest": g["earliest"],
             "latest": g["latest"],
             "codes": [p.nodes[m]["code"] for m in g["members"]],

@@ -4,10 +4,14 @@
 维护地层/遗迹之间的有向关系，提供：
 
 * 增加/删除关系时的有向环检测，并给出涉及新边的最短矛盾链；
-* 每个对象在所有约束下的最早层位（ASAP，最长前驱链）与最晚层位
-  （ALAP，偏序高度减去最长后继链），二者相等意味着层位被完全锁定；
-* 可互换对象组（在偏序中位置等价：祖先集合与后代集合完全相同）；
-* 增量重算：加边/删边后只失效或合并受影响节点的缓存，其余节点复用。
+* 每个对象在**本发掘区**所有约束下的最早层位（ASAP，本区最长前驱链）
+  与最晚层位（ALAP，本区偏序高度减去本区最长后继链），二者相等意味着
+  层位被完全锁定；跨区关系被禁止，每个发掘区是一张独立偏序，层位高度
+  按区分别计算，一区的长链不会影响别区对象的最晚层位；
+* 可互换对象组（同一区内偏序位置等价：祖先集合与后代集合完全相同，
+  分属不同区的对象不会成组）；
+* 增量重算：加边/删边后只失效、重建**所在区**的闭包与层位缓存，
+  受影响（本区）节点集合随结果返回，别区缓存与推断保持不变。
 
 时间语义统一为 ``early -> late``（早者指向晚者）。三类考古关系的
 端点映射：
@@ -83,7 +87,10 @@ class Poset:
         self._early = {}     # node -> 最早层位
         self._late = {}      # node -> 最晚层位
         self._tail = {}      # node -> 从该节点出发的最长链边数
-        self._height = None  # 偏序高度（最长链边数）
+        # 跨区关系被禁止，每个发掘区各自构成一张独立偏序：高度必须按区
+        # 分别计算，否则长链区会把孤立区对象的最晚层位“压”到本区之外。
+        self._area_heights = {}  # area_id -> 该区偏序高度（最长链边数）
+        self._height = None      # 全局高度 = max(各区高度)，仅供总览/布局
 
         self._next_node_id = 1
         self._next_rel_id = 1
@@ -102,6 +109,8 @@ class Poset:
             node_id = int(node_id)
             self._next_node_id = max(self._next_node_id, node_id + 1)
         node_id = str(node_id)
+        if area_id is not None:
+            area_id = str(area_id)
         self.nodes[node_id] = {
             "id": node_id, "code": code, "kind": kind,
             "name": name, "area_id": area_id,
@@ -136,6 +145,27 @@ class Poset:
         self._early = {}
         self._late = {}
         self._tail = {}
+        self._area_heights = {}
+        self._height = None
+
+    def _invalidate_area_layers(self, area_id):
+        """一区结构变更后，仅失效该区的层位缓存；别区推断完全不变。
+
+        可达闭包（_anc/_desc）由 :meth:`_invalidate_area_closures` 同批
+        失效；跨区无边，两类缓存都不会越区。
+        """
+        if area_id is None:
+            self._early = {}
+            self._late = {}
+            self._tail = {}
+            self._area_heights = {}
+        else:
+            for nid, n in self.nodes.items():
+                if n.get("area_id") == area_id:
+                    self._early.pop(nid, None)
+                    self._late.pop(nid, None)
+                    self._tail.pop(nid, None)
+            self._area_heights.pop(area_id, None)
         self._height = None
 
     @staticmethod
@@ -273,35 +303,25 @@ class Poset:
         return rel_id, affected
 
     def _incremental_add_edge(self, early, late):
-        """加一条新的时间边后的增量缓存合并。
+        """加一条新的时间边后的增量处理。
 
-        新可达对恰为 ``Anc(early) × Desc(late)``：
-        early 的每个祖先的后代集合并入 Desc(late)，
-        late 的每个后代的祖先集合并入 Anc(early)。
-        两集合若有交叠，同一节点的两份缓存分别更新。
+        新可达对恰为 ``Anc(early) × Desc(late)``（加边前图上的闭包），
+        这也是需要在前端高亮的受影响节点。
+
+        闭包缓存不做就地并合并：删边只会失效“当时可达性发生变化”的
+        节点缓存，而与早期断边同处一区、当时无关的节点缓存里可能仍含
+        陈旧条目（例如 x2 曾可达 x0，边删除后 x0 的祖先缓存未动，日后
+        新增一条进入 x0 的边时，若按 ``旧缓存 | 新祖先`` 合并，就会把
+        已消失的 x2 重新带回）。因此结构变更时本区闭包缓存整体失效、
+        下次查询惰性重建；跨区无边，只影响本区，别区缓存与推断不变。
         """
         anc_e = self.ancestors(early)
         desc_l = self.descendants(late)
-
-        desc_updates = {}
-        for x in anc_e:
-            desc_updates[x] = self._desc.get(x, {x}) | desc_l
-        self._desc.update(desc_updates)
-
-        anc_updates = {}
-        for y in desc_l:
-            anc_updates[y] = self._anc.get(y, {y}) | anc_e
-        self._anc.update(anc_updates)
-
-        # 层位可能改变的节点恰为 Anc(early) ∪ Desc(late)：
-        # 前者最晚层位可能被压低，后者最早层位可能被抬高，
-        # 其余节点层位不变。层位缓存在结构变化后统一失效，
-        # 下次查询时沿新边惰性重算（仅触及受影响节点）。
         affected = set(anc_e) | set(desc_l)
-        self._early = {}
-        self._late = {}
-        self._tail = {}
-        self._height = None
+
+        self._invalidate_area_closures(self.nodes[early].get("area_id"))
+        # 层位缓存在结构变化后统一失效，下次查询时沿新边惰性重算。
+        self._invalidate_area_layers(self.nodes[early].get("area_id"))
         return affected
 
     def remove_rel(self, rid):
@@ -310,37 +330,57 @@ class Poset:
         if r is None:
             return set()
         early, late = self.endpoints(r["type"], r["s"], r["o"])
+
+        # 先在“删边前”的现存图上做无缓存 BFS。删边后唯一可能消失的
+        # 可达对恰为 Anc(early) × Desc(late)：任何新断开的 x→y 路径，
+        # 其尾段必含 early→late。不能改用删边后的图，也不能从
+        # _anc/_desc 缓存反推——前者会漏掉仅经此边可达的节点，
+        # 后者本身可能已含正要消失的可达对（链式删边时的陈旧条目）。
+        A = self._bfs(early, self.rad)   # 删边前 early 的祖先
+        D = self._bfs(late, self.adj)    # 删边前 late 的后代
+        parallel = len(self.adj.get(early, {}).get(late, ())) > 1
+
         self._drop_rel_from_adj(rid)
         del self.rels[rid]
 
         affected = set()
-        if not self.adj.get(early, {}).get(late):
+        if not parallel:
             # 该对节点间已无任何关系，时间边真正消失。
-            # 可达缓存可精确失效：仅 early 祖先们的后代集合、
-            # late 后代们的祖先集合可能“变短”。
-            A = set(self._anc.get(early, {early}))
-            D = set(self._desc.get(late, {late}))
-            for x in A:
-                self._desc.pop(x, None)
-            for y in D:
-                self._anc.pop(y, None)
-            # 受影响节点（前端用于“只重算高亮”）：
-            # 1) 可达性发生变化的节点（祖先侧/后代侧闭包）；
-            # 2) 最长出链可能回缩的节点——凡能到达 early 者，其 tail
-            #    都可能因 early 一侧变短而改变（即使其路径不经过 late，
-            #    例如 u→early 另有分支时）。
+            area_id = self.nodes[early].get("area_id")
+            # 闭包缓存按区失效：可能变短的条目恰为 A 中节点的 _desc、
+            # D 中节点的 _anc；为稳妥起见（陈旧缓存可能牵连更多条目），
+            # 直接清本区全部闭包——跨区无边，闭包不会越区，别区缓存与
+            # 推断全部保留，下次查询惰性重建。
+            self._invalidate_area_closures(area_id)
+            # 受影响节点（前端用于“只重算高亮”）：可达性或最长出链可能
+            # 变化的节点 = A ∪ D。
             affected = set(A) | set(D)
-            for y in D:
-                affected |= self.ancestors(y)
-            for x in A:
-                affected |= self.descendants(x)
-            # 最长链回缩可能改变任意相关节点的层位，且传播面在删边时
-            # 难以精确界定，层位缓存整体失效、按需惰性重算。
-            self._early = {}
-            self._late = {}
-            self._tail = {}
-            self._height = None
+            # 本区层位缓存整体失效、按需惰性重算；别区推断保持不变。
+            self._invalidate_area_layers(area_id)
         return affected
+
+    def _bfs(self, src, neighbors):
+        """在现存邻接表上从 src 出发的无缓存可达集合（含自身）。"""
+        seen = {src}
+        q = deque([src])
+        while q:
+            u = q.popleft()
+            for v in neighbors.get(u, {}):
+                if v not in seen:
+                    seen.add(v)
+                    q.append(v)
+        return seen
+
+    def _invalidate_area_closures(self, area_id):
+        """失效本区全部祖先/后代闭包缓存（别区不动）。"""
+        if area_id is None:
+            self._desc = {}
+            self._anc = {}
+            return
+        for nid, n in self.nodes.items():
+            if n.get("area_id") == area_id:
+                self._desc.pop(nid, None)
+                self._anc.pop(nid, None)
 
     # ------------------------------------------------------------------
     # 可达性（惰性 DFS，带记忆）
@@ -379,17 +419,42 @@ class Poset:
         self._early[node] = best
         return best
 
-    def _get_height(self):
-        """偏序高度 = 全图最长链的边数。
+    def _area_ids(self):
+        """图中出现的全部发掘区 id（未归属对象归入 None 桶）。"""
+        return {n.get("area_id") for n in self.nodes.values()}
 
-        直接遍历每个节点的 tail_len，而不是复用 earliest 缓存：
-        未被查询过的节点不会有 earliest 缓存，取缓存最大值会漏算。
+    def _area_height(self, area_id):
+        """某发掘区偏序高度 = 区内最长链边数。
+
+        跨区关系被禁止，不同区的层位互不可比；直接遍历该区节点的
+        tail_len，而不是复用 earliest 缓存——未查询过的节点没有缓存，
+        取缓存最大值会漏算。
+        """
+        cached = self._area_heights.get(area_id)
+        if cached is not None:
+            return cached
+        h = 0
+        for nid, n in self.nodes.items():
+            if n.get("area_id") == area_id:
+                h = max(h, self._tail_len(nid))
+        self._area_heights[area_id] = h
+        return h
+
+    def area_height(self, node):
+        """节点所在区的偏序高度。"""
+        return self._area_height(self.nodes[node].get("area_id"))
+
+    def _get_height(self):
+        """全局高度 = 各区高度的最大值（供总览/整体布局使用）。
+
+        层位窗口的实际计算用 :meth:`area_height` 按区取高度，
+        避免长链区影响孤立区对象的最晚层位。
         """
         if self._height is not None:
             return self._height
         h = 0
-        for n in self.nodes:
-            h = max(h, self._tail_len(n))
+        for area_id in self._area_ids():
+            h = max(h, self._area_height(area_id))
         self._height = h
         return h
 
@@ -404,15 +469,17 @@ class Poset:
         return best
 
     def latest(self, node):
-        """最晚层位：高度 - 从该节点出发的最长链长度。
+        """最晚层位：所在区高度 - 从该节点出发的最长链长度。
 
-        层位编号从最早（0）到最晚（height）。earliest == latest 时
-        该单位的相对位置被约束完全锁定；窗口越大，可浮动空间越大。
+        层位编号在每个发掘区内各自从最早（0）到最晚（area_height），
+        不跨区比较。earliest == latest 时该单位的相对位置在本区约束下
+        被完全锁定；窗口越大，可浮动空间越大。
         """
         cached = self._late.get(node)
         if cached is not None:
             return cached
-        val = self._get_height() - self._tail_len(node)
+        val = self._area_height(self.nodes[node].get("area_id")) \
+            - self._tail_len(node)
         self._late[node] = val
         return val
 
@@ -420,20 +487,26 @@ class Poset:
     # 可互换对象组
     # ------------------------------------------------------------------
     def interchangeable_groups(self):
-        """位置等价类：严格祖先集合与严格后代集合完全相同的节点。
+        """位置等价类：同发掘区内、严格祖先集合与严格后代集合完全相同
+        的节点。
+
+        必须先按区划分再比较闭包：跨区对象之间没有任何时间边，分属
+        不同区的孤立对象虽各自的祖先/后代集合都为空，却并不可互换，
+        因为它们参与的是两套互相独立的偏序。
 
         （使用去掉自身的集合：组内两节点不可比，故彼此不在对方的
         祖先/后代中，其余前驱后继则必须完全一致。）
-        同组节点可在全部线性序中互换排列，即“仍可互换的对象组”。
+        同组节点可在本区全部线性序中互换排列，即“仍可互换的对象组”。
         仅返回大小 >= 2 的组。
         """
         groups = {}
         for n in self.nodes:
-            key = (frozenset(self.ancestors(n) - {n}),
+            key = (self.nodes[n].get("area_id"),
+                   frozenset(self.ancestors(n) - {n}),
                    frozenset(self.descendants(n) - {n}))
             groups.setdefault(key, []).append(n)
         result = []
-        for members in groups.values():
+        for (area_id, _, _), members in groups.items():
             if len(members) >= 2:
                 members_sorted = sorted(
                     members,
@@ -441,8 +514,10 @@ class Poset:
                                    self.nodes[x]["code"]))
                 result.append({
                     "members": members_sorted,
+                    "area_id": area_id,
                     "earliest": self.earliest(members_sorted[0]),
                     "latest": self.latest(members_sorted[0]),
                 })
-        result.sort(key=lambda g: (g["earliest"], g["members"][0]))
+        result.sort(key=lambda g: (g.get("area_id") or "",
+                                   g["earliest"], g["members"][0]))
         return result
